@@ -1,83 +1,46 @@
 #include <algorithm> // std::max_element
+#include <algorithm>
 #include <cmath> // pow, tanh, expf
 #include <filesystem>
 #include <fstream>
-#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 
 #include "dsp.h"
-#include "registry.h"
 
 #define tanh_impl_ std::tanh
 // #define tanh_impl_ fast_tanh_
 
 constexpr const long _INPUT_BUFFER_SAFETY_FACTOR = 32;
 
-nam::DSP::DSP(const int in_channels, const int out_channels, const double expected_sample_rate)
+nam::DSP::DSP(const double expected_sample_rate)
 : mExpectedSampleRate(expected_sample_rate)
-, mInChannels(in_channels)
-, mOutChannels(out_channels)
 {
-  if (in_channels <= 0 || out_channels <= 0)
-  {
-    throw std::runtime_error("Channel counts must be positive");
-  }
 }
 
 void nam::DSP::prewarm()
 {
-  if (mMaxBufferSize == 0)
-  {
-    SetMaxBufferSize(4096);
-  }
-  const int prewarmSamples = PrewarmSamples();
-  if (prewarmSamples == 0)
+  if (_prewarm_samples == 0)
     return;
 
-  const size_t bufferSize = std::max(mMaxBufferSize, 1);
-  // Allocate buffers for all channels
-  std::vector<std::vector<NAM_SAMPLE>> inputBuffers(mInChannels);
-  std::vector<std::vector<NAM_SAMPLE>> outputBuffers(mOutChannels);
-  std::vector<NAM_SAMPLE*> inputPtrs(mInChannels);
-  std::vector<NAM_SAMPLE*> outputPtrs(mOutChannels);
+  NAM_SAMPLE sample = 0;
+  NAM_SAMPLE* sample_ptr = &sample;
 
-  for (int ch = 0; ch < mInChannels; ch++)
+  // pre-warm the model for a model-specific number of samples
+  for (long i = 0; i < _prewarm_samples; i++)
   {
-    inputBuffers[ch].resize(bufferSize, (NAM_SAMPLE)0.0);
-    inputPtrs[ch] = inputBuffers[ch].data();
-  }
-  for (int ch = 0; ch < mOutChannels; ch++)
-  {
-    outputBuffers[ch].resize(bufferSize, (NAM_SAMPLE)0.0);
-    outputPtrs[ch] = outputBuffers[ch].data();
-  }
-
-  int samplesProcessed = 0;
-  while (samplesProcessed < prewarmSamples)
-  {
-    this->process(inputPtrs.data(), outputPtrs.data(), bufferSize);
-    samplesProcessed += bufferSize;
+    this->process(sample_ptr, sample_ptr, 1);
+    this->finalize_(1);
+    sample = 0;
   }
 }
 
-void nam::DSP::process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames)
+void nam::DSP::process(NAM_SAMPLE* input, NAM_SAMPLE* output, const int num_frames)
 {
-  // Default implementation is the null operation: copy input to output
-  // For now, assume 1:1 channel mapping (first min(in_channels, out_channels) channels)
-  const int channelsToProcess = std::min(mInChannels, mOutChannels);
-  for (int ch = 0; ch < channelsToProcess; ch++)
-  {
-    for (int i = 0; i < num_frames; i++)
-      output[ch][i] = input[ch][i];
-  }
-  // Zero out any extra output channels
-  for (int ch = channelsToProcess; ch < mOutChannels; ch++)
-  {
-    for (int i = 0; i < num_frames; i++)
-      output[ch][i] = (NAM_SAMPLE)0.0;
-  }
+  // Default implementation is the null operation
+  for (size_t i = 0; i < num_frames; i++)
+    output[i] = input[i];
 }
 
 double nam::DSP::GetLoudness() const
@@ -89,65 +52,18 @@ double nam::DSP::GetLoudness() const
   return mLoudness;
 }
 
-void nam::DSP::Reset(const double sampleRate, const int maxBufferSize)
-{
-  // Some subclasses might want to throw an exception if the sample rate is "wrong".
-  // This could be under a debugging flag potentially.
-  mExternalSampleRate = sampleRate;
-  mHaveExternalSampleRate = true;
-  SetMaxBufferSize(maxBufferSize);
-
-  prewarm();
-}
-
 void nam::DSP::SetLoudness(const double loudness)
 {
   mLoudness = loudness;
   mHasLoudness = true;
 }
 
-void nam::DSP::SetMaxBufferSize(const int maxBufferSize)
-{
-  mMaxBufferSize = maxBufferSize;
-}
-
-double nam::DSP::GetInputLevel()
-{
-  return mInputLevel.level;
-}
-
-double nam::DSP::GetOutputLevel()
-{
-  return mOutputLevel.level;
-}
-
-bool nam::DSP::HasInputLevel()
-{
-  return mInputLevel.haveLevel;
-}
-
-bool nam::DSP::HasOutputLevel()
-{
-  return mOutputLevel.haveLevel;
-}
-
-void nam::DSP::SetInputLevel(const double inputLevel)
-{
-  mInputLevel.haveLevel = true;
-  mInputLevel.level = inputLevel;
-}
-
-void nam::DSP::SetOutputLevel(const double outputLevel)
-{
-  mOutputLevel.haveLevel = true;
-  mOutputLevel.level = outputLevel;
-}
+void nam::DSP::finalize_(const int num_frames) {}
 
 // Buffer =====================================================================
 
-nam::Buffer::Buffer(const int in_channels, const int out_channels, const int receptive_field,
-                    const double expected_sample_rate)
-: nam::DSP(in_channels, out_channels, expected_sample_rate)
+nam::Buffer::Buffer(const int receptive_field, const double expected_sample_rate)
+: nam::DSP(expected_sample_rate)
 {
   this->_set_receptive_field(receptive_field);
 }
@@ -160,77 +76,45 @@ void nam::Buffer::_set_receptive_field(const int new_receptive_field)
 void nam::Buffer::_set_receptive_field(const int new_receptive_field, const int input_buffer_size)
 {
   this->_receptive_field = new_receptive_field;
-  const int in_channels = NumInputChannels();
-  const int out_channels = NumOutputChannels();
-
-  // Resize buffers for all input channels
-  _input_buffers.resize(in_channels);
-  for (int ch = 0; ch < in_channels; ch++)
-  {
-    _input_buffers[ch].resize(input_buffer_size);
-    std::fill(_input_buffers[ch].begin(), _input_buffers[ch].end(), 0.0f);
-  }
-
-  // Resize output buffers (though they'll be resized per call in _update_buffers_)
-  _output_buffers.resize(out_channels);
-
+  this->_input_buffer.resize(input_buffer_size);
+  std::fill(this->_input_buffer.begin(), this->_input_buffer.end(), 0.0f);
   this->_reset_input_buffer();
 }
 
-void nam::Buffer::_update_buffers_(NAM_SAMPLE** input, const int num_frames)
+void nam::Buffer::_update_buffers_(NAM_SAMPLE* input, const int num_frames)
 {
-  const int in_channels = NumInputChannels();
-  const int out_channels = NumOutputChannels();
-
-  // Make sure that the buffers are big enough for the receptive field and the
-  // frames needed. All channels use the same buffer size.
-  const long minimum_input_buffer_size = (long)this->_receptive_field + _INPUT_BUFFER_SAFETY_FACTOR * num_frames;
-
-  for (int ch = 0; ch < in_channels; ch++)
+  // Make sure that the buffer is big enough for the receptive field and the
+  // frames needed!
   {
-    if ((long)this->_input_buffers[ch].size() < minimum_input_buffer_size)
+    const long minimum_input_buffer_size = (long)this->_receptive_field + _INPUT_BUFFER_SAFETY_FACTOR * num_frames;
+    if ((long)this->_input_buffer.size() < minimum_input_buffer_size)
     {
       long new_buffer_size = 2;
       while (new_buffer_size < minimum_input_buffer_size)
         new_buffer_size *= 2;
-      this->_input_buffers[ch].resize(new_buffer_size);
-      std::fill(this->_input_buffers[ch].begin(), this->_input_buffers[ch].end(), 0.0f);
+      this->_input_buffer.resize(new_buffer_size);
+      std::fill(this->_input_buffer.begin(), this->_input_buffer.end(), 0.0f);
     }
   }
 
   // If we'd run off the end of the input buffer, then we need to move the data
-  // back to the start of the buffer and start again. All channels move together.
-  const long buffer_size = (long)this->_input_buffers[0].size();
-  if (this->_input_buffer_offset + num_frames > buffer_size)
+  // back to the start of the buffer and start again.
+  if (this->_input_buffer_offset + num_frames > (long)this->_input_buffer.size())
     this->_rewind_buffers_();
-
-  // Put the new samples into the input buffer for each channel
-  for (int ch = 0; ch < in_channels; ch++)
-  {
-    for (long i = this->_input_buffer_offset, j = 0; j < num_frames; i++, j++)
-      this->_input_buffers[ch][i] = (float)input[ch][j];
-  }
-
-  // Resize output buffers for all output channels
-  for (int ch = 0; ch < out_channels; ch++)
-  {
-    this->_output_buffers[ch].resize(num_frames);
-    std::fill(this->_output_buffers[ch].begin(), this->_output_buffers[ch].end(), 0.0f);
-  }
+  // Put the new samples into the input buffer
+  for (long i = this->_input_buffer_offset, j = 0; j < num_frames; i++, j++)
+    this->_input_buffer[i] = input[j];
+  // And resize the output buffer:
+  this->_output_buffer.resize(num_frames);
+  std::fill(this->_output_buffer.begin(), this->_output_buffer.end(), 0.0f);
 }
 
 void nam::Buffer::_rewind_buffers_()
 {
-  const int in_channels = NumInputChannels();
-
-  // Rewind buffers for all input channels (they all move together)
-  for (int ch = 0; ch < in_channels; ch++)
-  {
-    // Copy the input buffer back
-    // RF-1 samples because we've got at least one new one inbound.
-    for (long i = 0, j = this->_input_buffer_offset - this->_receptive_field; i < this->_receptive_field; i++, j++)
-      this->_input_buffers[ch][i] = this->_input_buffers[ch][j];
-  }
+  // Copy the input buffer back
+  // RF-1 samples because we've got at least one new one inbound.
+  for (long i = 0, j = this->_input_buffer_offset - this->_receptive_field; i < this->_receptive_field; i++, j++)
+    this->_input_buffer[i] = this->_input_buffer[j];
   // And reset the offset.
   // Even though we could be stingy about that one sample that we won't be using
   // (because a new set is incoming) it's probably not worth the
@@ -244,16 +128,17 @@ void nam::Buffer::_reset_input_buffer()
   this->_input_buffer_offset = this->_receptive_field;
 }
 
-void nam::Buffer::_advance_input_buffer_(const int num_frames)
+void nam::Buffer::finalize_(const int num_frames)
 {
+  this->nam::DSP::finalize_(num_frames);
   this->_input_buffer_offset += num_frames;
 }
 
 // Linear =====================================================================
 
-nam::Linear::Linear(const int in_channels, const int out_channels, const int receptive_field, const bool _bias,
-                    const std::vector<float>& weights, const double expected_sample_rate)
-: nam::Buffer(in_channels, out_channels, receptive_field, expected_sample_rate)
+nam::Linear::Linear(const int receptive_field, const bool _bias, const std::vector<float>& weights,
+                    const double expected_sample_rate)
+: nam::Buffer(receptive_field, expected_sample_rate)
 {
   if ((int)weights.size() != (receptive_field + (_bias ? 1 : 0)))
     throw std::runtime_error(
@@ -267,196 +152,104 @@ nam::Linear::Linear(const int in_channels, const int out_channels, const int rec
   this->_bias = _bias ? weights[receptive_field] : (float)0.0;
 }
 
-void nam::Linear::process(NAM_SAMPLE** input, NAM_SAMPLE** output, const int num_frames)
+void nam::Linear::process(NAM_SAMPLE* input, NAM_SAMPLE* output, const int num_frames)
 {
   this->nam::Buffer::_update_buffers_(input, num_frames);
 
-  const int in_channels = NumInputChannels();
-  const int out_channels = NumOutputChannels();
-
-  // For now, Linear processes each input channel independently to corresponding output channel
-  // This is a simple implementation - can be extended later for cross-channel mixing
-  const int channelsToProcess = std::min(in_channels, out_channels);
-
   // Main computation!
-  for (int ch = 0; ch < channelsToProcess; ch++)
+  for (size_t i = 0; i < num_frames; i++)
   {
-    for (int i = 0; i < num_frames; i++)
-    {
-      const long offset = this->_input_buffer_offset - this->_weight.size() + i + 1;
-      auto input_vec = Eigen::Map<const Eigen::VectorXf>(&this->_input_buffers[ch][offset], this->_receptive_field);
-      output[ch][i] = this->_bias + this->_weight.dot(input_vec);
-    }
+    const size_t offset = this->_input_buffer_offset - this->_weight.size() + i + 1;
+    auto input = Eigen::Map<const Eigen::VectorXf>(&this->_input_buffer[offset], this->_receptive_field);
+    output[i] = this->_bias + this->_weight.dot(input);
   }
-
-  // Zero out any extra output channels
-  for (int ch = channelsToProcess; ch < out_channels; ch++)
-  {
-    for (int i = 0; i < num_frames; i++)
-      output[ch][i] = (NAM_SAMPLE)0.0;
-  }
-
-  // Prepare for next call:
-  nam::Buffer::_advance_input_buffer_(num_frames);
-}
-
-// Factory
-std::unique_ptr<nam::DSP> nam::linear::Factory(const nlohmann::json& config, std::vector<float>& weights,
-                                               const double expectedSampleRate)
-{
-  const int receptive_field = config["receptive_field"];
-  const bool bias = config["bias"];
-  // Default to 1 channel in/out for backward compatibility
-  const int in_channels = config.value("in_channels", 1);
-  const int out_channels = config.value("out_channels", 1);
-  return std::make_unique<nam::Linear>(in_channels, out_channels, receptive_field, bias, weights, expectedSampleRate);
 }
 
 // NN modules =================================================================
 
-// Conv1x1 ====================================================================
-
-nam::Conv1x1::Conv1x1(const int in_channels, const int out_channels, const bool _bias, const int groups)
+void nam::Conv1D::set_weights_(std::vector<float>::iterator& weights)
 {
-  // Validate that channels divide evenly by groups
-  if (in_channels % groups != 0)
+  if (this->_weight.size() > 0)
   {
-    throw std::runtime_error("in_channels (" + std::to_string(in_channels) + ") must be divisible by numGroups ("
-                             + std::to_string(groups) + ")");
+    const long out_channels = this->_weight[0].rows();
+    const long in_channels = this->_weight[0].cols();
+    // Crazy ordering because that's how it gets flattened.
+    for (auto i = 0; i < out_channels; i++)
+      for (auto j = 0; j < in_channels; j++)
+        for (size_t k = 0; k < this->_weight.size(); k++)
+          this->_weight[k](i, j) = *(weights++);
   }
-  if (out_channels % groups != 0)
-  {
-    throw std::runtime_error("out_channels (" + std::to_string(out_channels) + ") must be divisible by numGroups ("
-                             + std::to_string(groups) + ")");
-  }
-
-  this->_num_groups = groups;
-  this->_do_bias = _bias;
-
-  // Check for depthwise convolution: groups == in_channels == out_channels
-  // In this case, each channel is processed independently with a single weight,
-  // so we can use efficient element-wise multiplication instead of matrix multiplication.
-  this->_is_depthwise = (groups == in_channels && in_channels == out_channels);
-
-  if (this->_is_depthwise)
-  {
-    // Depthwise: store one weight per channel
-    this->_channels = in_channels;
-    this->_depthwise_weight.resize(in_channels);
-    this->_depthwise_weight.setZero();
-    // Clear the matrix weight (not used)
-    this->_weight.resize(0, 0);
-  }
-  else
-  {
-    // Non-depthwise: store full weight matrix (block-diagonal for grouped convolutions)
-    this->_weight.resize(out_channels, in_channels);
-    this->_weight.setZero();
-    this->_channels = 0;
-  }
-
-  if (_bias)
-  {
-    this->_bias.resize(out_channels);
-    this->_bias.setZero();
-  }
+  for (long i = 0; i < this->_bias.size(); i++)
+    this->_bias(i) = *(weights++);
 }
 
-
-void nam::Conv1x1::SetMaxBufferSize(const int maxBufferSize)
+void nam::Conv1D::set_size_(const int in_channels, const int out_channels, const int kernel_size, const bool do_bias,
+                            const int _dilation)
 {
-  _output.resize(get_out_channels(), maxBufferSize);
+  this->_weight.resize(kernel_size);
+  for (size_t i = 0; i < this->_weight.size(); i++)
+    this->_weight[i].resize(out_channels,
+                            in_channels); // y = Ax, input array (C,L)
+  if (do_bias)
+    this->_bias.resize(out_channels);
+  else
+    this->_bias.resize(0);
+  this->_dilation = _dilation;
+}
+
+void nam::Conv1D::set_size_and_weights_(const int in_channels, const int out_channels, const int kernel_size,
+                                        const int _dilation, const bool do_bias, std::vector<float>::iterator& weights)
+{
+  this->set_size_(in_channels, out_channels, kernel_size, do_bias, _dilation);
+  this->set_weights_(weights);
+}
+
+void nam::Conv1D::process_(const Eigen::MatrixXf& input, Eigen::MatrixXf& output, const long i_start, const long ncols,
+                           const long j_start) const
+{
+  // This is the clever part ;)
+  for (size_t k = 0; k < this->_weight.size(); k++)
+  {
+    const long offset = this->_dilation * (k + 1 - this->_weight.size());
+    if (k == 0)
+      output.middleCols(j_start, ncols) = this->_weight[k] * input.middleCols(i_start + offset, ncols);
+    else
+      output.middleCols(j_start, ncols) += this->_weight[k] * input.middleCols(i_start + offset, ncols);
+  }
+  if (this->_bias.size() > 0)
+    output.middleCols(j_start, ncols).colwise() += this->_bias;
+}
+
+long nam::Conv1D::get_num_weights() const
+{
+  long num_weights = this->_bias.size();
+  for (size_t i = 0; i < this->_weight.size(); i++)
+    num_weights += this->_weight[i].size();
+  return num_weights;
+}
+
+nam::Conv1x1::Conv1x1(const int in_channels, const int out_channels, const bool _bias)
+{
+  this->_weight.resize(out_channels, in_channels);
+  this->_do_bias = _bias;
+  if (_bias)
+    this->_bias.resize(out_channels);
 }
 
 void nam::Conv1x1::set_weights_(std::vector<float>::iterator& weights)
 {
-  if (this->_is_depthwise)
-  {
-    // Depthwise convolution: one weight per channel
-    for (int c = 0; c < this->_channels; c++)
-    {
-      this->_depthwise_weight(c) = *(weights++);
-    }
-  }
-  else if (this->_weight.size() > 0)
-  {
-    const long out_channels = this->_weight.rows();
-    const long in_channels = this->_weight.cols();
-    const int numGroups = this->_num_groups;
-    const long out_per_group = out_channels / numGroups;
-    const long in_per_group = in_channels / numGroups;
-
-    // For grouped convolutions, weights are organized per group
-    // Weight layout: weights are [group0, group1, ..., groupN-1]
-    // Each group's weight matrix is (out_channels/numGroups, in_channels/numGroups)
-    for (int g = 0; g < numGroups; g++)
-    {
-      for (auto i = 0; i < out_per_group; i++)
-      {
-        for (auto j = 0; j < in_per_group; j++)
-        {
-          this->_weight(g * out_per_group + i, g * in_per_group + j) = *(weights++);
-        }
-      }
-    }
-  }
+  for (int i = 0; i < this->_weight.rows(); i++)
+    for (int j = 0; j < this->_weight.cols(); j++)
+      this->_weight(i, j) = *(weights++);
   if (this->_do_bias)
     for (int i = 0; i < this->_bias.size(); i++)
       this->_bias(i) = *(weights++);
 }
 
-long nam::Conv1x1::get_out_channels() const
+Eigen::MatrixXf nam::Conv1x1::process(const Eigen::MatrixXf& input) const
 {
-  if (this->_is_depthwise)
-    return this->_channels;
-  return this->_weight.rows();
-}
-
-long nam::Conv1x1::get_in_channels() const
-{
-  if (this->_is_depthwise)
-    return this->_channels;
-  return this->_weight.cols();
-}
-
-Eigen::MatrixXf nam::Conv1x1::process(const Eigen::MatrixXf& input, const int num_frames) const
-{
-  Eigen::MatrixXf result(get_out_channels(), num_frames);
-
-  if (this->_is_depthwise)
-  {
-    // Depthwise convolution: efficient element-wise multiplication
-    // Each channel is scaled by its corresponding weight
-    result.noalias() = this->_depthwise_weight.asDiagonal() * input.leftCols(num_frames);
-  }
-  else
-  {
-    // Single GEMM for all cases - block-diagonal zero structure handles grouping
-    result.noalias() = this->_weight * input.leftCols(num_frames);
-  }
-
   if (this->_do_bias)
-    result.colwise() += this->_bias;
-
-  return result;
-}
-
-void nam::Conv1x1::process_(const Eigen::Ref<const Eigen::MatrixXf>& input, const int num_frames)
-{
-  assert(num_frames <= _output.cols());
-
-  if (this->_is_depthwise)
-  {
-    // Depthwise convolution: efficient element-wise multiplication
-    // Each channel is scaled by its corresponding weight
-    _output.leftCols(num_frames).noalias() = this->_depthwise_weight.asDiagonal() * input.leftCols(num_frames);
-  }
+    return (this->_weight * input).colwise() + this->_bias;
   else
-  {
-    // Single GEMM for all cases - block-diagonal zero structure handles grouping
-    _output.leftCols(num_frames).noalias() = this->_weight * input.leftCols(num_frames);
-  }
-
-  if (this->_do_bias)
-    _output.leftCols(num_frames).colwise() += this->_bias;
+    return this->_weight * input;
 }
